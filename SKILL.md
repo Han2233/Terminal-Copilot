@@ -61,7 +61,7 @@ curl -s -X POST http://localhost:9876/exec \
   -d '{"command":"你要执行的命令"}'
 ```
 
-返回示例：
+返回示例（成功）：
 ```json
 {
   "success": true,
@@ -71,14 +71,61 @@ curl -s -X POST http://localhost:9876/exec \
 }
 ```
 
+**`force` 参数**：危险命令会被自动拦截，需要用户在扩展侧边栏手动批准。仅在用户明确授权时可加 `"force": true` 跳过确认：
+
+```bash
+curl -s -X POST http://localhost:9876/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"危险命令", "force": true}'
+```
+
+**危险命令被拦截时返回**：
+```json
+{
+  "success": false,
+  "command": "rm -rf /tmp/test",
+  "error": "用户在扩展中拒绝了该命令的执行",
+  "dangers": ["强制递归删除 (rm -rf)"]
+}
+```
+
+## 安全机制
+
+### 自动拦截的危险命令类型
+
+以下命令执行前会自动弹出侧边栏要求人工确认（15 秒超时）：
+
+| 等级 | 类型 | 示例 |
+|------|------|------|
+| 🔴 critical | 强制删除 | `rm -rf /` |
+| 🔴 critical | 强制杀进程 | `kill -9` |
+| 🔴 critical | 系统关机 | `reboot`, `shutdown`, `halt` |
+| 🔴 critical | 磁盘操作 | `dd`, `mkfs`, `fdisk` |
+| 🔴 critical | 下载执行 | `curl ... | bash` |
+| 🔴 critical | 写入磁盘 | `> /dev/sda` |
+| 🟡 high | 终止进程 | `kill`, `pkill`, `killall` |
+| 🟡 high | 权限修改 | `chmod 777`, `chown` 系统路径 |
+| 🟡 high | 防火墙 | `iptables` |
+| 🟡 high | 移动系统文件 | `mv ... /etc/` |
+| 🟡 high | 删除 crontab | `crontab -r` |
+| 🟡 high | 文件属性 | `chattr` |
+
+### 确认流程
+
+1. AI 执行危险命令 → 服务端检测命中规则
+2. 扩展侧边栏弹出确认弹窗，显示命令和触发的规则
+3. 用户点击「批准」→ 命令继续执行
+4. 用户点击「拒绝」→ 返回 403 错误
+5. 15 秒未操作 → 超时返回
+
 ## 使用规范
 
 ### 安全原则
 
-1. **禁止执行危险命令**：不要执行 `rm -rf`、`kill -9`、`reboot`、`shutdown`、`dd`、`mkfs` 等破坏性命令，除非用户明确要求
+1. **信任安全机制**：危险命令会自动拦截，不要主动加 `force` 绕过
 2. **先读后写**：修改文件前先 `cat` 查看内容，确认无误后再操作
-3. **先确认再执行**：对于影响服务的操作（重启应用、修改配置等），先告知用户将要执行什么，得到确认后再执行
-4. **避免长时间阻塞命令**：不要执行 `tail -f`、`top`、`vim` 等需要交互或持续运行的命令，命令超时时间为 15 秒
+3. **避免长时间阻塞命令**：不要执行 `tail -f`、`top`、`vim` 等需要交互或持续运行的命令，命令超时时间为 15 秒
+4. **Aone Shell 双重防护**：即使通过扩展确认，Aone Shell 服务端也有自己的命令审查机制
 
 ### 操作流程
 
@@ -127,8 +174,10 @@ curl -s -X POST http://localhost:9876/exec -H 'Content-Type: application/json' -
 |------|------|------|
 | `connected: false` | 扩展未连接 | 提示用户检查中继服务、扩展、终端页面 |
 | `未找到终端页面` | 浏览器没有打开 Aone Shell | 提示用户打开终端页面 |
-| `请求超时` | 命令执行超过 15 秒 | 命令可能需要交互或运行时间过长 |
+| `请求超时` | 命令执行超过 15 秒，或危险命令 15 秒内未确认 | 缩短命令或提醒用户在侧边栏确认 |
 | `命令发送失败` | xterm 输入方式不可用 | 提示用户刷新终端页面 |
+| `用户在扩展中拒绝了` | 用户在侧边栏点击了拒绝 | 确认用户意图后重新执行 |
+| `Chrome 扩展未连接` | 中继服务和扩展间 WebSocket 断开 | 等待自动重连（3 秒），或提示用户刷新扩展 |
 
 ## 示例对话
 
@@ -139,3 +188,11 @@ curl -s -X POST http://localhost:9876/exec -H 'Content-Type: application/json' -
 2. 执行 `java -version 2>&1` 获取 Java 版本
 3. 执行 `ps aux | grep java | grep -v grep` 检查进程
 4. 整理结果告知用户
+
+**用户**：帮我重启一下应用
+
+**AI 应该做的**：
+1. 先 `curl /read` 查看当前目录和环境
+2. 告知用户将要执行 `appctl.sh restart`，说明这是危险操作
+3. 执行命令（会被安全机制拦截，用户需在侧边栏批准）
+4. 等待确认后返回执行结果

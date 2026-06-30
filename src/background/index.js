@@ -1,21 +1,32 @@
 const RELAY_URL = 'ws://localhost:9876/ws';
 const RECONNECT_INTERVAL = 3000;
+const DATA_TIMEOUT = 30000; // 30 秒无数据 = 视为死连接，强制重连
 
 let ws = null;
+let lastDataTime = 0; // 最后一次收到数据的时间戳
+let reconnectTimer = null; // 防抖：同一时刻最多一个重连定时器
+let pendingConfirms = new Map(); // 待确认的危险命令
+
+function scheduleReconnect(delay) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectRelay, delay);
+}
 
 function connectRelay() {
+  // 已经在连接中则跳过
   if (ws && ws.readyState <= 1) return;
 
   try {
     ws = new WebSocket(RELAY_URL);
   } catch (e) {
     console.log('[bg] WebSocket 创建失败:', e.message);
-    setTimeout(connectRelay, RECONNECT_INTERVAL);
+    scheduleReconnect(RECONNECT_INTERVAL);
     return;
   }
 
   ws.onopen = () => {
     console.log('[bg] 已连接到中继服务');
+    lastDataTime = Date.now();
     chrome.action.setBadgeText({ text: 'ON' });
     chrome.action.setBadgeBackgroundColor({ color: '#22c55e' });
   };
@@ -24,15 +35,20 @@ function connectRelay() {
     console.log('[bg] 与中继服务断开，将重连...');
     chrome.action.setBadgeText({ text: '' });
     ws = null;
-    setTimeout(connectRelay, RECONNECT_INTERVAL);
+    scheduleReconnect(RECONNECT_INTERVAL);
   };
 
+  // onerror 时也调度重连；如果 onclose 随之而来，scheduleReconnect 会防抖合并
+  // 如果连接从未建立（ERR_CONNECTION_REFUSED），onclose 不会触发，靠这里兜底
   ws.onerror = () => {
+    console.log('[bg] WebSocket 错误');
     ws = null;
-    setTimeout(connectRelay, RECONNECT_INTERVAL);
+    scheduleReconnect(RECONNECT_INTERVAL);
   };
 
   ws.onmessage = async (event) => {
+    lastDataTime = Date.now();
+
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -42,14 +58,40 @@ function connectRelay() {
 
     const { requestId, type, command } = msg;
 
+    // 响应服务端心跳
+    if (type === 'ping') {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'pong' }));
+      }
+      return;
+    }
+
     if (type === 'read') {
       const result = await readTerminal();
-      ws.send(JSON.stringify({ requestId, ...result }));
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ requestId, ...result }));
+      }
     }
 
     if (type === 'exec') {
       const result = await execCommand(command);
-      ws.send(JSON.stringify({ requestId, ...result }));
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ requestId, ...result }));
+      }
+    }
+
+    // 危险命令确认请求：打开侧边栏等待用户批准
+    if (type === 'confirm') {
+      const { dangers } = msg;
+      pendingConfirms.set(requestId, { command, dangers });
+
+      // 打开侧边栏
+      try {
+        await chrome.sidePanel.open({ windowId: -1 }); // 当前窗口
+        console.log('[bg] 已打开侧边栏，等待用户确认危险命令:', command);
+      } catch (e) {
+        console.log('[bg] 打开侧边栏失败:', e.message);
+      }
     }
   };
 }
@@ -225,9 +267,44 @@ function sleep(ms) {
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
+// 监听侧边栏的确认结果
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'CONFIRM_RESPONSE') {
+    const { requestId, approved } = message;
+    const pending = pendingConfirms.get(requestId);
+    if (pending && ws && ws.readyState === 1) {
+      console.log(`[bg] 用户${approved ? '批准' : '拒绝'}危险命令: ${pending.command}`);
+      ws.send(JSON.stringify({ requestId, approved }));
+    }
+    pendingConfirms.delete(requestId);
+  }
+  if (message.type === 'GET_PENDING_CONFIRMS') {
+    const confirms = [];
+    for (const [id, info] of pendingConfirms) {
+      confirms.push({ requestId: id, command: info.command, dangers: info.dangers });
+    }
+    sendResponse({ confirms });
+    return true; // 异步响应
+  }
+});
+
 connectRelay();
 
-// 定时重连检查
+// 定时重连检查 + 健康监控
 setInterval(() => {
-  if (!ws || ws.readyState > 1) connectRelay();
+  const now = Date.now();
+
+  // 检查 1: 连接是否断开
+  if (!ws || ws.readyState > 1) {
+    connectRelay();
+    return;
+  }
+
+  // 检查 2: 连接是否"假活"——长时间无数据说明链路已死但 onclose 未触发
+  if (ws.readyState === 1 && lastDataTime > 0 && (now - lastDataTime) > DATA_TIMEOUT) {
+    console.log('[bg] 超过 ' + DATA_TIMEOUT/1000 + ' 秒未收到数据，连接可能已死，强制重连...');
+    try { ws.close(); } catch(e) {}
+    ws = null;
+    scheduleReconnect(500);
+  }
 }, RECONNECT_INTERVAL);

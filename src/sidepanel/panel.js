@@ -467,4 +467,84 @@ document.getElementById('commandInput').addEventListener('keydown', (e) => {
   } else {
     log('请先打开 shell.alibaba-inc.com 终端页面');
   }
+
+  // 轮询待确认的危险命令
+  checkPendingConfirms();
+  setInterval(checkPendingConfirms, 2000);
 })();
+
+// ========== 危险命令确认弹窗 ==========
+
+let currentConfirmId = null;
+
+async function checkPendingConfirms() {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'GET_PENDING_CONFIRMS' });
+    if (resp?.confirms?.length > 0) {
+      const latest = resp.confirms[resp.confirms.length - 1];
+      // 只在新的确认请求时弹出
+      if (latest.requestId !== currentConfirmId) {
+        showConfirmDialog(latest);
+      }
+    } else if (currentConfirmId) {
+      // 确认请求已消失（被处理或超时），关闭弹窗
+      hideConfirmDialog();
+    }
+  } catch (e) {
+    // background 可能未连接
+  }
+}
+
+function showConfirmDialog(confirm) {
+  currentConfirmId = confirm.requestId;
+
+  const overlay = document.getElementById('confirmOverlay');
+  const commandEl = document.getElementById('confirmCommand');
+  const dangersEl = document.getElementById('confirmDangers');
+  const headerEl = document.getElementById('confirmHeader');
+  const titleEl = document.getElementById('confirmTitle');
+
+  // 判断最高危险等级
+  const hasCritical = confirm.dangers.some(d => d.level === 'critical');
+
+  // 样式
+  headerEl.className = 'confirm-header ' + (hasCritical ? 'danger' : 'warn');
+  titleEl.className = 'title ' + (hasCritical ? 'danger' : 'warn');
+  titleEl.textContent = hasCritical ? '⛔ 高危命令确认' : '⚠️ 危险命令确认';
+  document.getElementById('btnApprove').className = hasCritical ? 'btn danger' : 'btn safe';
+
+  // 命令
+  commandEl.textContent = confirm.command;
+
+  // 危险规则
+  dangersEl.innerHTML = '';
+  confirm.dangers.forEach(d => {
+    const li = document.createElement('li');
+    li.className = d.level;
+    li.innerHTML = `<span>${d.level === 'critical' ? '🔴' : '🟡'}</span> ${d.desc}`;
+    dangersEl.appendChild(li);
+  });
+
+  // 显示
+  overlay.classList.add('show');
+  log(`⚠️ 危险命令待确认: ${confirm.command.substring(0, 60)}`, 'error');
+}
+
+function hideConfirmDialog() {
+  document.getElementById('confirmOverlay').classList.remove('show');
+  currentConfirmId = null;
+}
+
+function respondConfirm(approved) {
+  if (!currentConfirmId) return;
+  chrome.runtime.sendMessage({
+    type: 'CONFIRM_RESPONSE',
+    requestId: currentConfirmId,
+    approved
+  });
+  log(approved ? '✅ 已批准执行' : '🚫 已拒绝执行', approved ? 'success' : 'error');
+  hideConfirmDialog();
+}
+
+document.getElementById('btnApprove').addEventListener('click', () => respondConfirm(true));
+document.getElementById('btnDeny').addEventListener('click', () => respondConfirm(false));

@@ -119,6 +119,16 @@ curl -X POST http://localhost:9876/exec \
 }
 ```
 
+**危险命令自动拦截**：检测到 `rm -rf`、`kill -9`、`reboot`、`dd` 等危险操作时，会弹出侧边栏要求人工确认（15s 超时）。确认通过后继续执行，拒绝返回 403。
+
+加 `"force": true` 可跳过确认（仅供紧急情况）：
+```json
+{
+  "command": "重启命令",
+  "force": true
+}
+```
+
 **响应**：
 ```json
 {
@@ -128,6 +138,24 @@ curl -X POST http://localhost:9876/exec \
   "method": "exec-and-read"
 }
 ```
+
+**被拦截时响应**：
+```json
+{
+  "success": false,
+  "error": "用户在扩展中拒绝了该命令的执行",
+  "dangers": ["强制递归删除 (rm -rf)"]
+}
+```
+
+## 安全机制
+
+| 等级 | 拦截规则 | 示例 |
+|------|----------|------|
+| 🔴 critical | 强制删除、强制杀进程、关机重启、磁盘操作、下载执行 | `rm -rf /`, `kill -9`, `reboot`, `dd`, `curl \| bash` |
+| 🟡 high | 终止进程、chmod 777、iptables、移动系统文件 | `kill`, `chmod`, `chown /`, `crontab -r` |
+
+危险命令执行时，扩展侧边栏会弹出确认弹窗，显示命令内容和触发规则。Aone Shell 服务端也有独立的命令审查，形成双重防护。
 
 ## 在 AI Agent 中使用
 
@@ -194,4 +222,7 @@ terminal-copilot/
 - 中继服务只监听 `localhost`，不暴露到外网
 - 命令在你已登录的终端会话中执行，使用你自己的权限
 - `POST /exec` 会等待命令执行完成（最多 15 秒超时）
+- 危险命令需在侧边栏手动批准（15 秒超时），加 `"force": true` 可跳过
+- 中继服务与扩展间有 **WebSocket 心跳**（10s）和 **健康监控**（30s 无数据自动重连），避免连接假死
 - 如果扩展图标没有绿色 ON 角标，请确认中继服务已启动并刷新终端页面
+- Aone Shell 自身也有命令审查机制，部分命令即使通过扩展确认也可能被服务端拦截
