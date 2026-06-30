@@ -1,0 +1,12 @@
+{
+  "name": "terminal-copilot-relay",
+  "version": "0.1.0",
+  "description": "Terminal Copilot 本地中继服务 - 连接 AI Agent 和 Chrome 扩展",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
